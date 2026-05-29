@@ -1,11 +1,54 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
 using System.IO;
 
 namespace SteganoWave
 {
-    /// <summary>Hides/extracts data in/from a wave stream</summary>
+    /// <summary>
+    /// Hides/extracts data in/from a wave stream using FFT phase encoding.
+    ///
+    /// This is the technique from the lecture slide
+    /// "Sound Steganography in Uncompressed Audio Using Phase Encoding":
+    ///
+    ///   Embedding : WAV -> FFT -> select frequency bins (via key)
+    ///               -> encode each bit as +d phi (bit 1) / -d phi (bit 0)
+    ///               -> Inverse FFT -> stego WAV
+    ///   Extraction: stego WAV -> FFT -> read phase of the same bins
+    ///               -> detect the sign of the phase -> reconstruct bits.
+    ///
+    /// Only the phase of the selected bins is changed, the magnitude is left
+    /// untouched, so the carrier wave keeps its spectral envelope.
+    /// </summary>
     public class WaveUtility
     {
+        /// <summary>
+        /// Number of samples that make up one FFT block. Must be a power of two
+        /// (the radix-2 FFT below relies on that).
+        /// </summary>
+        private const int BlockSize = 1024;
+
+        /// <summary>
+        /// Highest frequency bin that may carry data. We stay in the lower part
+        /// of the spectrum [1 .. MaxBin], where real speech/music has enough
+        /// energy for the phase to survive PCM quantisation. DC (bin 0) and the
+        /// Nyquist bin (BlockSize/2) are never used.
+        /// </summary>
+        private const int MaxBin = BlockSize / 4; // 256
+
+        /// <summary>How many bits are stored in a single FFT block.</summary>
+        private const int BitsPerBlock = 32;
+
+        /// <summary>
+        /// The phase that encodes a bit: +PhaseShift means "1", -PhaseShift
+        /// means "0". The slide suggests very small shifts (e.g. +-0.1 rad) for
+        /// inaudibility. Because we extract blindly (without the original wave)
+        /// from a re-quantised 8/16-bit PCM signal, we set the phase to +-pi/2,
+        /// which puts the decision boundary (phase = 0) as far as possible from
+        /// both states and makes the recovered bit robust to rounding noise.
+        /// Lower this value if imperceptibility matters more than robustness.
+        /// </summary>
+        private const double PhaseShift = Math.PI / 2;
+
         /// <summary>
         /// The read-only stream.
         /// Clean wave for hiding,
@@ -37,169 +80,355 @@ namespace SteganoWave
         {
             this.sourceStream = sourceStream;
             this.bytesPerSample = sourceStream.Format.wBitsPerSample / 8;
+
+            if (bytesPerSample != 1 && bytesPerSample != 2)
+                throw new Exception("Only 8-bit and 16-bit PCM wave files are supported.");
         }
 
         /// <summary>
-        /// Hide [messageStream] in [sourceStream],
-        /// write the result to [destinationStream]
+        /// Hide [messageStream] in [sourceStream] using phase encoding,
+        /// write the resulting carrier wave to [destinationStream].
         /// </summary>
-        /// <param name="messageStream">The message to hide</param>
+        /// <param name="messageStream">The message to hide (length prefix included)</param>
         /// <param name="keyStream">
-        /// A key stream that specifies how many samples shall be
-        /// left clean between two changed samples
+        /// A key stream. It is used to choose which frequency bins of every
+        /// block carry the message bits.
         /// </param>
         public void Hide(Stream messageStream, Stream keyStream)
         {
-            byte[] sample = new byte[bytesPerSample];
+            double[] samples = ReadAllSamples();
+            int blockCount = samples.Length / BlockSize;
 
-            // make sure we read the message from the start
             messageStream.Seek(0, SeekOrigin.Begin);
-
+            List<int> bits = new List<int>();
             int currentByte;
-            // walk through every byte of the message (length prefix included)
             while ((currentByte = messageStream.ReadByte()) >= 0)
             {
-                // hide the 8 bits of the byte, least significant bit first
                 for (int bitIndex = 0; bitIndex < 8; bitIndex++)
-                {
-                    int messageBit = (currentByte >> bitIndex) & 1;
-
-                    // the key tells us how many samples this bit "costs":
-                    // (distance - 1) samples stay clean, the last one carries the bit
-                    int distance = GetKeyValue(keyStream);
-
-                    // copy the clean samples unchanged into the destination
-                    for (int i = 0; i < distance - 1; i++)
-                    {
-                        if (sourceStream.Copy(sample, 0, bytesPerSample, destinationStream) <= 0)
-                            throw new Exception("Unexpected end of carrier stream while hiding.");
-                    }
-
-                    // read the sample that will carry the bit
-                    if (sourceStream.Read(sample, 0, bytesPerSample) <= 0)
-                        throw new Exception("Unexpected end of carrier stream while hiding.");
-
-                    // store the message bit in the least significant bit of the sample
-                    sample[0] = (byte)((sample[0] & 0xFE) | messageBit);
-
-                    // write the modified sample to the destination
-                    destinationStream.Write(sample, 0, bytesPerSample);
-                }
+                    bits.Add((currentByte >> bitIndex) & 1);
             }
 
-            // copy whatever is left of the carrier wave unchanged,
-            // so the output keeps the full length declared in the header
-            while (sourceStream.Copy(sample, 0, bytesPerSample, destinationStream) > 0)
+            double[] re = new double[BlockSize];
+            double[] im = new double[BlockSize];
+
+            int bitPos = 0;
+            for (int block = 0; block < blockCount && bitPos < bits.Count; block++)
             {
-                // keep copying until the data chunk is exhausted
+                int offset = block * BlockSize;
+
+                LoadBlock(samples, offset, re, im);
+                Fft(re, im, false);
+
+                int[] bins = SelectBins(keyStream, BitsPerBlock);
+
+                for (int i = 0; i < bins.Length && bitPos < bits.Count; i++)
+                {
+                    EncodeBit(re, im, bins[i], bits[bitPos]);
+                    bitPos++;
+                }
+
+                Fft(re, im, true);
+                StoreBlock(samples, offset, re);
             }
+
+            if (bitPos < bits.Count)
+                throw new Exception(
+                    "The carrier file is too small for this message and key.\r\n"
+                    + "Bits to hide: " + bits.Count + "\r\n"
+                    + "Capacity (bits): " + (long)blockCount * BitsPerBlock);
+
+            WriteAllSamples(samples);
         }
 
         /// <summary>Extract a message from [sourceStream] into [messageStream]</summary>
         /// <param name="messageStream">Empty stream to receive the extracted message</param>
         /// <param name="keyStream">
-        /// A key stream that specifies how many samples shall be
-        /// skipped between two carrier samples
+        /// The same key stream that was used while hiding, it selects the
+        /// frequency bins that carry the message bits.
         /// </param>
         public void Extract(Stream messageStream, Stream keyStream)
         {
-            byte[] sample = new byte[bytesPerSample];
+            double[] samples = ReadAllSamples();
+            int blockCount = samples.Length / BlockSize;
 
-            // The message was stored as [4-byte length][message bytes].
-            // We don't know how long it is until we have decoded the first 4 bytes.
             byte[] header = new byte[4];
-            long totalBytes = header.Length; // at least the length prefix
+            long totalBytes = header.Length;
+            long byteIndex = 0;
+            int currentByte = 0;
+            int bitInByte = 0;
+            bool done = false;
 
-            for (long byteIndex = 0; byteIndex < totalBytes; byteIndex++)
+            double[] re = new double[BlockSize];
+            double[] im = new double[BlockSize];
+
+            for (int block = 0; block < blockCount && !done; block++)
             {
-                // rebuild one byte out of 8 sample LSBs (least significant bit first)
-                int currentByte = 0;
-                for (int bitIndex = 0; bitIndex < 8; bitIndex++)
-                {
-                    // the key tells us how many samples this bit "costs":
-                    // (distance - 1) clean samples are skipped, the last one carries the bit
-                    int distance = GetKeyValue(keyStream);
+                int offset = block * BlockSize;
 
-                    for (int i = 0; i < distance - 1; i++)
+                LoadBlock(samples, offset, re, im);
+                Fft(re, im, false);
+
+                int[] bins = SelectBins(keyStream, BitsPerBlock);
+
+                for (int i = 0; i < bins.Length && !done; i++)
+                {
+                    int bit = DecodeBit(re, im, bins[i]);
+                    currentByte |= (bit << bitInByte);
+                    bitInByte++;
+
+                    if (bitInByte < 8)
+                        continue;
+
+                    if (byteIndex < header.Length)
                     {
-                        if (sourceStream.Read(sample, 0, bytesPerSample) <= 0)
-                            throw new Exception("Unexpected end of carrier stream while extracting.");
+                        header[byteIndex] = (byte)currentByte;
+
+                        if (byteIndex == header.Length - 1)
+                        {
+                            int messageLength = BitConverter.ToInt32(header, 0);
+                            if (messageLength < 0)
+                                throw new Exception("Could not extract a message (wrong key?).");
+
+                            totalBytes = header.Length + (long)messageLength;
+                        }
+                    }
+                    else
+                    {
+                        messageStream.WriteByte((byte)currentByte);
                     }
 
-                    if (sourceStream.Read(sample, 0, bytesPerSample) <= 0)
-                        throw new Exception("Unexpected end of carrier stream while extracting.");
+                    byteIndex++;
+                    currentByte = 0;
+                    bitInByte = 0;
 
-                    currentByte |= ((sample[0] & 1) << bitIndex);
+                    if (byteIndex >= totalBytes)
+                        done = true;
                 }
+            }
 
-                if (byteIndex < header.Length)
+            if (!done)
+                throw new Exception("Could not extract the complete message (wrong key or corrupt carrier?).");
+        }
+
+        /// <summary>
+        /// Minimum length (in samples) of a carrier wave that can hold a message
+        /// of [messageLength] bytes with the phase-encoding scheme.
+        /// </summary>
+        /// <param name="keyStream">Key stream (only its position is reset here)</param>
+        /// <param name="messageLength">Length of the message in bytes (length prefix included)</param>
+        /// <returns>Minimum required count of samples</returns>
+        public static long CheckKeyForMessage(Stream keyStream, long messageLength)
+        {
+            long messageBits = messageLength * 8;
+            long requiredBlocks = (messageBits + BitsPerBlock - 1) / BitsPerBlock;
+
+            keyStream.Seek(0, SeekOrigin.Begin);
+            return requiredBlocks * BlockSize;
+        }
+
+        #region frequency-domain helpers
+
+        /// <summary>Encode one bit into the phase of bin [k], keeping its magnitude.</summary>
+        private static void EncodeBit(double[] re, double[] im, int k, int bit)
+        {
+            double magnitude = Math.Sqrt(re[k] * re[k] + im[k] * im[k]);
+            double phase = (bit == 1) ? PhaseShift : -PhaseShift;
+
+            re[k] = magnitude * Math.Cos(phase);
+            im[k] = magnitude * Math.Sin(phase);
+
+            // keep the spectrum conjugate-symmetric so the IFFT stays real
+            int mirror = re.Length - k;
+            re[mirror] = re[k];
+            im[mirror] = -im[k];
+        }
+
+        /// <summary>Read the bit stored in the phase of bin [k] (+phase -> 1).</summary>
+        private static int DecodeBit(double[] re, double[] im, int k)
+        {
+            double phase = Math.Atan2(im[k], re[k]);
+            return (phase >= 0) ? 1 : 0;
+        }
+
+        /// <summary>
+        /// Choose [count] distinct frequency bins (in [1 .. MaxBin]) for the
+        /// current block. The walk is driven entirely by the key, so the encoder
+        /// and the decoder pick exactly the same bins.
+        /// </summary>
+        private static int[] SelectBins(Stream keyStream, int count)
+        {
+            HashSet<int> used = new HashSet<int>();
+            int[] bins = new int[count];
+
+            long position = 0;
+            for (int i = 0; i < count; i++)
+            {
+                int step = GetKeyValue(keyStream);
+                if (step == 0) step = 1;          // always move forward
+                position += step;
+
+                int bin = (int)(((position - 1) % MaxBin) + 1); // 1 .. MaxBin
+                while (used.Contains(bin))
+                    bin = (bin % MaxBin) + 1;     // linear probe to a free bin
+
+                used.Add(bin);
+                bins[i] = bin;
+            }
+            return bins;
+        }
+
+        #endregion
+
+        #region sample <-> stream conversion
+
+        /// <summary>Read the whole data chunk of [sourceStream] as real samples.</summary>
+        private double[] ReadAllSamples()
+        {
+            int dataLength = (int)sourceStream.Length;
+            byte[] buffer = new byte[dataLength];
+
+            int read = 0, n;
+            while (read < dataLength &&
+                   (n = sourceStream.Read(buffer, read, dataLength - read)) > 0)
+            {
+                read += n;
+            }
+
+            int sampleCount = read / bytesPerSample;
+            double[] samples = new double[sampleCount];
+
+            for (int i = 0; i < sampleCount; i++)
+            {
+                if (bytesPerSample == 2)
                 {
-                    // still reading the length prefix
-                    header[byteIndex] = (byte)currentByte;
-
-                    if (byteIndex == header.Length - 1)
-                    {
-                        int messageLength = BitConverter.ToInt32(header, 0);
-                        if (messageLength < 0)
-                            throw new Exception("Could not extract a message (wrong key?).");
-
-                        totalBytes = header.Length + (long)messageLength;
-                    }
+                    // 16-bit PCM is signed, little-endian
+                    short value = (short)(buffer[2 * i] | (buffer[2 * i + 1] << 8));
+                    samples[i] = value;
                 }
                 else
                 {
-                    // these are the actual message bytes
-                    messageStream.WriteByte((byte)currentByte);
+                    // 8-bit PCM is unsigned (0 .. 255)
+                    samples[i] = buffer[i];
+                }
+            }
+            return samples;
+        }
+
+        /// <summary>Write [samples] back to [destinationStream] as PCM bytes.</summary>
+        private void WriteAllSamples(double[] samples)
+        {
+            byte[] buffer = new byte[samples.Length * bytesPerSample];
+
+            for (int i = 0; i < samples.Length; i++)
+            {
+                int value = (int)Math.Round(samples[i]);
+
+                if (bytesPerSample == 2)
+                {
+                    if (value > short.MaxValue) value = short.MaxValue;
+                    else if (value < short.MinValue) value = short.MinValue;
+
+                    buffer[2 * i] = (byte)(value & 0xFF);
+                    buffer[2 * i + 1] = (byte)((value >> 8) & 0xFF);
+                }
+                else
+                {
+                    if (value > 255) value = 255;
+                    else if (value < 0) value = 0;
+
+                    buffer[i] = (byte)value;
+                }
+            }
+
+            destinationStream.Write(buffer, 0, buffer.Length);
+        }
+
+        /// <summary>Copy [BlockSize] samples starting at [offset] into the FFT buffers.</summary>
+        private static void LoadBlock(double[] samples, int offset, double[] re, double[] im)
+        {
+            for (int i = 0; i < BlockSize; i++)
+            {
+                re[i] = samples[offset + i];
+                im[i] = 0.0;
+            }
+        }
+
+        /// <summary>Copy the real part of an IFFT result back into the sample array.</summary>
+        private static void StoreBlock(double[] samples, int offset, double[] re)
+        {
+            for (int i = 0; i < BlockSize; i++)
+                samples[offset + i] = re[i];
+        }
+
+        #endregion
+
+        #region FFT
+
+        /// <summary>
+        /// In-place iterative radix-2 Cooley-Tukey FFT.
+        /// [invert] == false: forward transform (time -> frequency).
+        /// [invert] == true : inverse transform (frequency -> time), 1/N scaled.
+        /// </summary>
+        private static void Fft(double[] re, double[] im, bool invert)
+        {
+            int n = re.Length;
+
+            // bit-reversal permutation
+            for (int i = 1, j = 0; i < n; i++)
+            {
+                int bit = n >> 1;
+                for (; (j & bit) != 0; bit >>= 1)
+                    j ^= bit;
+                j ^= bit;
+
+                if (i < j)
+                {
+                    double tr = re[i]; re[i] = re[j]; re[j] = tr;
+                    double ti = im[i]; im[i] = im[j]; im[j] = ti;
+                }
+            }
+
+            // butterflies
+            for (int len = 2; len <= n; len <<= 1)
+            {
+                double angle = 2.0 * Math.PI / len * (invert ? 1.0 : -1.0);
+                double wRe = Math.Cos(angle);
+                double wIm = Math.Sin(angle);
+
+                for (int i = 0; i < n; i += len)
+                {
+                    double curRe = 1.0, curIm = 0.0;
+                    for (int k = 0; k < len / 2; k++)
+                    {
+                        int a = i + k;
+                        int b = i + k + len / 2;
+
+                        double tRe = re[b] * curRe - im[b] * curIm;
+                        double tIm = re[b] * curIm + im[b] * curRe;
+
+                        re[b] = re[a] - tRe;
+                        im[b] = im[a] - tIm;
+                        re[a] += tRe;
+                        im[a] += tIm;
+
+                        double nextRe = curRe * wRe - curIm * wIm;
+                        curIm = curRe * wIm + curIm * wRe;
+                        curRe = nextRe;
+                    }
+                }
+            }
+
+            if (invert)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    re[i] /= n;
+                    im[i] /= n;
                 }
             }
         }
 
-        /// <summary>Counts the samples that will be skipped using the specified key stream</summary>
-        /// <param name="keyStream">Key stream</param>
-        /// <param name="messageLength">Length of the message</param>
-        /// <returns>Minimum length (in samples) of an audio file</returns>
-        public static long CheckKeyForMessage(Stream keyStream, long messageLength)
-        {
-            long messageLengthBits = messageLength * 8;
-            long countRequiredSamples = 0;
-
-            if (messageLengthBits > keyStream.Length)
-            {
-                long keyLength = keyStream.Length;
-
-                // read existing key
-                byte[] keyBytes = new byte[keyLength];
-                keyStream.Read(keyBytes, 0, keyBytes.Length);
-
-                // Every byte stands for the distance between two useable samples.
-                // The sum of those distances is the required count of samples.
-                countRequiredSamples = SumKeyArray(keyBytes);
-
-                // The key must be repeated, until every bit of the message has a key byte.
-                double countKeyCopies = messageLengthBits / keyLength;
-                countRequiredSamples = (long)(countRequiredSamples * countKeyCopies);
-            }
-            else
-            {
-                byte[] keyBytes = new byte[messageLengthBits];
-                keyStream.Read(keyBytes, 0, keyBytes.Length);
-                countRequiredSamples = SumKeyArray(keyBytes);
-            }
-
-            keyStream.Seek(0, SeekOrigin.Begin);
-            return countRequiredSamples;
-        }
-
-        private static long SumKeyArray(byte[] values)
-        {
-            long sum = 0;
-            foreach (int value in values)
-            {	// '0' causes a distance of one sample,
-                // every other key causes a distance of its exact value.
-                sum += (value == 0) ? 1 : value;
-            }
-            return sum;
-        }
+        #endregion
 
         /// <summary>
         /// Read the next byte of the key stream.
